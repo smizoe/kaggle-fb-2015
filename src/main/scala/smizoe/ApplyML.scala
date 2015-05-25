@@ -17,13 +17,13 @@ object ContextPack{
 
 object CV extends S3Conf with RFConf with Util {
 
-  def oneRun(trainingDf: DataFrame, validationDf: DataFrame): RDD[(Int, String, Double, Double)]= {
-    val categoricalFeaturesInfo = makeCategoricalFeaturesInfo(trainingDf, "outcome", unnecessaryFeatureNames, allMappings)
+  def oneRun(trainingDf: DataFrame, validationDf: DataFrame): RDD[(Double, String, Double, Double)]= {
+    val categoricalFeaturesInfo = makeCategoricalFeaturesInfo(trainingDf, "outcome", unnecessaryFeatureNames, allMappings, Set("device", "url"))
     val labeledPoints = convertToLabeledPoints(trainingDf, "outcome", allMappings, unnecessaryFeatureNames.toSet)
     val model = RandomForest.trainClassifier(labeledPoints, 2, categoricalFeaturesInfo, numTrees, featureSubsetStrategy, impurity, maxDepth, maxBins)
     val validationData = convertToVectors(validationDf, allMappings, unnecessaryFeatureNames.toSet + "outcome")
     val prediction     = model.predict(validationData)
-    validationDf.select("bid_id", "bidder_id", "outcome").rdd.zip(prediction).map{ case (Row(bid_id: Int, bidder_id: String, outcome: Double), pred: Double) =>
+    validationDf.select("bid_id", "bidder_id", "outcome").rdd.zip(prediction).map{ case (Row(bid_id: Double, bidder_id: String, outcome: Double), pred: Double) =>
       (bid_id, bidder_id, outcome, pred)
     }
   }
@@ -33,16 +33,14 @@ object CV extends S3Conf with RFConf with Util {
     implicit val sc = new SparkContext(conf)
     implicit val sqlContext = new org.apache.spark.sql.SQLContext(sc)
 
-    val bidsDf = createTable(sc.textFile(dataDir + "bids.csv.gz"), bidsSchema)
+    val bidsDf = createTable(fromS3File(bucket, dataDir + "bids.csv.gz"), bidsSchema)
     val predictions = for(indx <- Range(1, numValidationPair + 1)) yield {
-      val biddersDf    = createTable(sc.textFile(dataDir + s"exploration/bidders_train_${indx}.csv"), biddersSchema)
-      val validationDf = createTable(sc.textFile(dataDir + s"exploration/bidders_validation_${indx}.csv"), biddersSchema)
+      val biddersDf    = createTable(fromS3File(bucket, dataDir + s"exploration/bidders_train_${indx}.csv"), biddersSchema)
+      val validationDf = createTable(fromS3File(bucket, dataDir + s"exploration/bidders_validation_${indx}.csv"), biddersSchema)
       val joinedTraining   = innerJoinOnBidderId(biddersDf, bidsDf)
-      joinedTraining.persist()
       val joinedValidation = innerJoinOnBidderId(validationDf, bidsDf)
       val result = oneRun(joinedTraining, joinedValidation)
-      joinedTraining.unpersist()
-      result.map{tuple => tuple.productIterator.toArray.mkString(",")}.saveAsTextFile(cvResultDir + s"result_${indx}.csv")
+      result.map{tuple => tuple.productIterator.toArray.mkString(",")}.saveAsTextFile(bucket + cvResultDir + s"/result_${indx}")
       result
     }
     val areasUnderRoc = predictions.map{ result =>
@@ -58,7 +56,7 @@ object CV extends S3Conf with RFConf with Util {
       getAreaUnderROC(probAndOutcome)
     }
     val avg = areasUnderRoc.reduce( _ + _ ) / numValidationPair
-    val sd  = ((areasUnderRoc.map( math.pow( _ ,  2) )).reduce(_ + _) - numValidationPair * math.pow(avg, 2)) / (numValidationPair - 1)
+    val sd  = math.sqrt(((areasUnderRoc.map( math.pow( _ ,  2) )).reduce(_ + _) - numValidationPair * math.pow(avg, 2)) / (numValidationPair - 1))
     println(s"Area under ROC curve of ${numValidationPair} CV sets => avg.: ${avg}, sd: ${sd}")
   }
 }
@@ -68,11 +66,10 @@ object Predict extends S3Conf with RFConf with Util {
     val conf = new SparkConf().setAppName("RandomForest-Predict")
     implicit val sc = new SparkContext(conf)
     implicit val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-    val bidsDf       = createTable(sc.textFile(dataDir + "bids.csv.gz"), bidsSchema)
-    val biddersDf    = createTable(sc.textFile(dataDir + s"submission/bidders_submission.csv"), submissionSchema)
+    val bidsDf       = createTable(fromS3File(bucket, dataDir + "bids.csv.gz"), bidsSchema)
+    val biddersDf    = createTable(fromS3File(bucket, dataDir + s"submission/bidders_submission.csv"), submissionSchema)
     val submissionDf = innerJoinOnBidderId(biddersDf, bidsDf)
     val vectors      = convertToVectors(submissionDf, allMappings, unnecessaryFeatureNames.toSet + "outcome")
-    vectors.persist()
     val model        = RandomForestModel.load(sc, modelDir)
 
     val predictionResult                 = model.predict(vectors)
@@ -86,7 +83,7 @@ object Predict extends S3Conf with RFConf with Util {
       val numOne = ary.count( v => v == 1.0)
       val prob   = (numOne.toDouble) / numObs
       (bidder_id, prob)
-    }.map{ tuple => tuple.productIterator.toArray.mkString(",") }.saveAsTextFile(predictionResultDir)
+    }.map{ tuple => tuple.productIterator.toArray.mkString(",") }.saveAsTextFile(bucket + predictionResultDir)
   }
 }
 
@@ -95,14 +92,13 @@ object Train extends S3Conf with RFConf with Util {
     val conf = new SparkConf().setAppName("RandomForest-Train")
     implicit val sc = new SparkContext(conf)
     implicit val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-    val bidsDf                  = createTable(sc.textFile(dataDir + "bids.csv.gz"), bidsSchema)
-    val biddersDf               = createTable(sc.textFile(dataDir + s"submission/bidders_submission_train.csv"), biddersSchema)
+    val bidsDf                  = createTable(fromS3File(bucket, dataDir + "bids.csv.gz"), bidsSchema)
+    val biddersDf               = createTable(fromS3File(bucket, dataDir + s"submission/bidders_submission_train.csv"), biddersSchema)
     val trainingDf              = innerJoinOnBidderId(biddersDf, bidsDf)
-    trainingDf.persist
-    val categoricalFeaturesInfo = makeCategoricalFeaturesInfo(trainingDf, "outcome", unnecessaryFeatureNames, allMappings)
+    val categoricalFeaturesInfo = makeCategoricalFeaturesInfo(trainingDf, "outcome", unnecessaryFeatureNames, allMappings, Set("device", "url"))
     val labeledPoints           = convertToLabeledPoints(trainingDf, "outcome", allMappings, unnecessaryFeatureNames.toSet)
     val model                   = RandomForest.trainClassifier(labeledPoints, 2, categoricalFeaturesInfo, numTrees, featureSubsetStrategy, impurity, maxDepth, maxBins)
-    model.save(sc, modelDir)
+    model.save(sc, bucket + modelDir)
     println("training succeeded")
   }
 }

@@ -1,5 +1,6 @@
 package smizoe
 import scala.io.Source
+import scala.math.BigDecimal
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.conf.Configuration
 import org.apache.spark.rdd.RDD
@@ -8,6 +9,7 @@ import org.apache.spark.SparkContext._
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
 import org.apache.spark.mllib.linalg.{Vectors, Vector}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.util.MLUtils
@@ -22,11 +24,12 @@ trait DataConf{
 }
 
 trait S3Conf extends DataConf{
-  val dataDir     = "s3://mizoe-kaggle-data/data/"
-  val mappingDir  = "s3://mizoe-kaggle-data/mappings/"
-  val schemaDir   = "s3://mizoe-kaggle-data/schemas/"
+  val bucket      = "s3://mizoe-kaggle-data"
+  val dataDir     = "/data/"
+  val mappingDir  = "/mappings/"
+  val schemaDir   = "/schema/"
   val conf        = new Configuration()
-  implicit val fs: FileSystem= FileSystem.get(new URI(dataDir),conf)
+  implicit val fs: FileSystem= FileSystem.get(new URI(bucket + dataDir),conf)
 }
 
 
@@ -37,16 +40,9 @@ trait MLConf {
 }
 
 trait RFConf extends MLConf{ this: DataConf with Util =>
-  val modelDir            = "s3://mizoe-kaggle-data/model/RF"
-  val cvResultDir         = "s3://mizoe-kaggle-data/cv-result/RF"
-  val predictionResultDir = "s3://mizoe-kaggle-data/submission-result/RF"
-
-  // ML Settings
-  val numTrees: Int=500
-  val featureSubsetStrategy: String = "auto"
-  val impurity:String = "gini"
-  val maxDepth: Int=4
-  val maxBins: Int = 100
+  val modelDir            = "/model/RF"
+  val cvResultDir         = "/cv-result/RF"
+  val predictionResultDir = "/submission-result/RF"
 
   lazy val biddersSchema = getSchema(strToHdfsPath(schemaDir, "bidders.schema"))
   lazy val bidsSchema    = getSchema(strToHdfsPath(schemaDir, "bids.schema"))
@@ -54,11 +50,21 @@ trait RFConf extends MLConf{ this: DataConf with Util =>
   private val paths = Seq("countries.map", "devices.map", "merchandises.map", "urls.map").map(strToHdfsPath(mappingDir, _))
   private val names = Seq("country", "device", "merchandise", "url")
   lazy val allMappings   = genAllMappings(names, paths)
-  val unnecessaryFeatureNames = Array("bidder_id", "payment_acount", "address", "bid_id", "auction", "ip")
+  val unnecessaryFeatureNames = Array("bidder_id", "bidder_id_left", "payment_account", "address", "bid_id", "auction", "ip")
+
+  // ML Settings
+  val numTrees: Int=30
+  val featureSubsetStrategy: String = "auto"
+  val impurity:String = "gini"
+  val maxDepth: Int=4
+  lazy val maxBins: Int = Seq(100, allMappings.values.map(_.size).max + 1).max
 }
 
 
 trait Util{
+  def fromS3File(bucket: String, path: String)(implicit sc: SparkContext) : RDD[String] = {
+    sc.textFile(bucket + path)
+  }
   def strToHdfsPath(dir: String, file: String): Path = {
     new Path(Paths.get(dir, file).toString)
   }
@@ -70,8 +76,24 @@ trait Util{
 
   def createTable(csv: RDD[String], schema: StructType)(implicit sqlContext: SQLContext): DataFrame = {
     import sqlContext.implicits._
+    val names       = schema.toIterator.map{case StructField(name, _, _, _) => name}.toSeq
+    val newColNames = names.map((name: String)=> "_" + name)
+    val expressions = names.zip(newColNames).map{case (orig, newN) => s"${newN} AS ${orig}"}
+    val toInt     = udf[Int, String]( _.toInt)
+    val toDouble  = udf[Double, String]( _.toDouble)
+    val toDecimal = udf[BigDecimal, String](BigDecimal(_))
+
     val rowRDD = csv.map(_.split(",")).map(p => Row.fromSeq(p))
-    sqlContext.createDataFrame(rowRDD, schema)
+    val df: DataFrame = sqlContext.createDataFrame(rowRDD, schema)
+    val newDf: DataFrame = schema.toIterator.foldLeft(df){ case (accDf: DataFrame, StructField(name, dtype, _, _)) => {
+      accDf.withColumn("_" + name, dtype match{
+        case _: DoubleType.type  => toDouble(accDf(name))
+        case _: StringType.type  => accDf(name)
+        case _: DecimalType      => toDouble(accDf(name)) // since this is to be used in MLLib
+        case _: IntegerType.type => toDouble(accDf(name)) // since this is to be used in MLLib
+      })
+    }}
+    newDf.selectExpr(expressions.toArray :_*)
   }
 
   def convertToLabeledPoints(df: DataFrame, outcomeName: String, factorConverter: Map[String, Map[String, Double]],
@@ -100,12 +122,13 @@ trait Util{
     df.map{ r =>
       val featuresWithHoles: Array[Option[Double]] = {for( indx <- Range(0, names.length)) yield {
         val name = names(indx)
-        if(factorsToRemove.contains(name))
+        if(factorsToRemove.contains(name)) {
           None
-        else{
-          if(factorConverter.contains(name))
-            factorConverter(name).get(r.getString(indx))
-          else
+        }else{
+          if(factorConverter.contains(name)) {
+            val converter = factorConverter(name)
+            Some(converter.getOrElse(r.getString(indx), converter.size.toDouble))
+          }else
             Some(r.getDouble(indx))
         }
       }}.toArray
@@ -190,17 +213,23 @@ trait Util{
     StructField(name, dataType)
   }
 
-  def makeCategoricalFeaturesInfo(df: DataFrame, outcomeName: String, factorsToRemove: Array[String], allMaps: Map[String, Map[String, Double]]): Map[Int, Int] ={
+  // needsDefaultValue contains the names of factors that have values which are 'unknown' to its Map;
+  // that is, if feature 'feat1' is contained in needsDefaultValue, df("feat1") contains a value which
+  // is not contained in allMaps("feat1") as its key
+  def makeCategoricalFeaturesInfo(df: DataFrame, outcomeName: String, factorsToRemove: Array[String],
+                                  allMaps: Map[String, Map[String, Double]], needsDefaultValue: Set[String]=Set()): Map[Int, Int] ={
     val names = df.columns
     val remainingFeatures = names.filterNot(name => name == outcomeName || factorsToRemove.contains(name))
     val factorNames = allMaps.keys
     factorNames.map { name: String =>
-      (remainingFeatures.indexOf(name), allMaps(name).size)
+      (remainingFeatures.indexOf(name),
+       if(needsDefaultValue.contains(name)) allMaps(name).size + 1 else  allMaps(name).size)
     }.toMap
   }
 
   def innerJoinOnBidderId(biddersDf: DataFrame, bidsDf: DataFrame): DataFrame = {
-    biddersDf.join(bidsDf, biddersDf("bidder_id") === bidsDf("bidder_id"), "inner")
+    val renamed = biddersDf.withColumnRenamed("bidder_id", "bidder_id_left")
+    renamed.join(bidsDf, renamed("bidder_id_left") === bidsDf("bidder_id"))
   }
 
 

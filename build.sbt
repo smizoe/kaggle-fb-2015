@@ -12,3 +12,5 @@ libraryDependencies ++= Seq(
   "org.apache.hadoop" % "hadoop-client"     % "2.4.0" % "provided",
   "org.scalatest"    % "scalatest_2.10"   % "2.2.4" % "test"
 )
+
+fork in Test := true
