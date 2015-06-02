@@ -33,10 +33,17 @@ trait S3Conf extends DataConf{
 }
 
 
-trait MLConf {
+trait MLConf { this: DataConf with Util =>
   val modelDir: String
   val cvResultDir: String
   val predictionResultDir: String
+  val unnecessaryFeatureNames = Array("bidder_id", "bidder_id_left", "payment_account", "address", "bid_id", "auction", "ip")
+  lazy val allMappings   = genAllMappings(names, paths)
+  val paths = Seq("countries.map", "devices.map", "merchandises.map", "urls.map").map(strToHdfsPath(mappingDir, _))
+  val names = Seq("country", "device", "merchandise", "url")
+  lazy val biddersSchema = getSchema(strToHdfsPath(schemaDir, "bidders.schema"))
+  lazy val bidsSchema    = getSchema(strToHdfsPath(schemaDir, "bids.schema"))
+  lazy val submissionSchema = getSchema(strToHdfsPath(schemaDir, "submission.schema"))
 }
 
 trait RFConf extends MLConf{ this: DataConf with Util =>
@@ -44,22 +51,62 @@ trait RFConf extends MLConf{ this: DataConf with Util =>
   val cvResultDir         = "/cv-result/RF"
   val predictionResultDir = "/submission-result/RF"
 
-  lazy val biddersSchema = getSchema(strToHdfsPath(schemaDir, "bidders.schema"))
-  lazy val bidsSchema    = getSchema(strToHdfsPath(schemaDir, "bids.schema"))
-  lazy val submissionSchema = getSchema(strToHdfsPath(schemaDir, "submission.schema"))
-  private val paths = Seq("countries.map", "devices.map", "merchandises.map", "urls.map").map(strToHdfsPath(mappingDir, _))
-  private val names = Seq("country", "device", "merchandise", "url")
-  lazy val allMappings   = genAllMappings(names, paths)
-  val unnecessaryFeatureNames = Array("bidder_id", "bidder_id_left", "payment_account", "address", "bid_id", "auction", "ip")
 
   // ML Settings
-  val numTrees: Int=30
+  val numTrees: Int= 50
   val featureSubsetStrategy: String = "auto"
   val impurity:String = "gini"
   val maxDepth: Int=4
   lazy val maxBins: Int = Seq(100, allMappings.values.map(_.size).max + 1).max
 }
 
+trait CVBase { this: Util with MLConf with S3Conf =>
+  import scala.language.reflectiveCalls
+  def oneRun[ModelType <: {def predict(targets: RDD[Vector]): RDD[Double]}](trainingDf: DataFrame, validationDf: DataFrame, modelMaker: RDD[LabeledPoint] => ModelType, useOneHot: Boolean = true): RDD[(Double, String, Double, Double)] ={
+    val labeledPoints = convertToLabeledPoints(trainingDf, "outcome", allMappings, unnecessaryFeatureNames.toSet, useOneHot)
+    val validationData =
+      if(useOneHot)
+        convertToVectorsWithOneHot(validationDf, allMappings, unnecessaryFeatureNames.toSet + "outcome")
+      else
+        convertToVectors(validationDf, allMappings, unnecessaryFeatureNames.toSet + "outcome")
+    val model = modelMaker(labeledPoints)
+    val prediction     = model.predict(validationData)
+    validationDf.select("bid_id", "bidder_id", "outcome").rdd.zip(prediction).map{ case (Row(bid_id: Double, bidder_id: String, outcome: Double), pred: Double) =>
+      (bid_id, bidder_id, outcome, pred)
+    }
+  }
+
+  def runCV[ModelType <: {def predict(targets: RDD[Vector]): RDD[Double]}]
+    (numValidationPair: Int,
+     modelMaker: RDD[LabeledPoint] => ModelType)
+    (implicit sc: SparkContext, sqlContext: SQLContext): Unit = {
+    val bidsDf = createTable(fromS3File(bucket, dataDir + "bids.csv.gz"), bidsSchema)
+    val predictions = for(indx <- Range(1, numValidationPair + 1)) yield {
+      val biddersDf    = createTable(fromS3File(bucket, dataDir + s"exploration/bidders_train_${indx}.csv"), biddersSchema)
+      val validationDf = createTable(fromS3File(bucket, dataDir + s"exploration/bidders_validation_${indx}.csv"), biddersSchema)
+      val joinedTraining   = innerJoinOnBidderId(biddersDf, bidsDf)
+      val joinedValidation = innerJoinOnBidderId(validationDf, bidsDf)
+      val result = oneRun[ModelType](joinedTraining, joinedValidation, modelMaker, false)
+      result.map{tuple => tuple.productIterator.toArray.mkString(",")}.saveAsTextFile(bucket + cvResultDir + s"/result_${indx}")
+      result
+    }
+    val areasUnderRoc = predictions.map{ result =>
+      val grouped = result.groupBy { case (bid_id, bidder_id, outcome, pred) => bidder_id}
+      val probAndOutcome= grouped.map { case (bidder_id, iterator) =>
+        val ary      = iterator.toArray
+        val totalObs = ary.length
+        val numOne   = ary.count{ case (bid_id, bidder_id, outcome, pred) => pred == 1.0}
+        val prob     = numOne.toDouble /totalObs
+        // prob. and outcome
+        (prob, ary(0)._3)
+      }.collect()
+      getAreaUnderROC(probAndOutcome)
+    }
+    val avg = areasUnderRoc.reduce( _ + _ ) / numValidationPair
+    val sd  = math.sqrt(((areasUnderRoc.map( math.pow( _ ,  2) )).reduce(_ + _) - numValidationPair * math.pow(avg, 2)) / (numValidationPair - 1))
+    println(s"Area under ROC curve of ${numValidationPair} CV sets => avg.: ${avg}, sd: ${sd}")
+  }
+}
 
 trait Util{
   def fromS3File(bucket: String, path: String)(implicit sc: SparkContext) : RDD[String] = {
@@ -97,7 +144,7 @@ trait Util{
   }
 
   def convertToLabeledPoints(df: DataFrame, outcomeName: String, factorConverter: Map[String, Map[String, Double]],
-                             factorsToRemove: Set[String], outcomeConverter: Map[String, Double] = Map()): RDD[LabeledPoint] = {
+                             factorsToRemove: Set[String], useOneHot: Boolean=true, outcomeConverter: Map[String, Double] = Map()): RDD[LabeledPoint] = {
     val names = df.columns
     val namesWithoutOutcome = names.filterNot( name => name == outcomeName)
     val outcomeIndx = names.indexOf(outcomeName)
@@ -134,6 +181,39 @@ trait Util{
       }}.toArray
       val features = featuresWithHoles.filterNot(_.isEmpty).map(_.get)
       Vectors.dense(features)
+    }
+  }
+  // convert a df to RDD[Vector] using one-hot encoding. We don't put 1 if an unknown factor value comes;
+  // that is, if we choose to use level 0, 1, 2,..., n in a factor with level > n, then we encode level k > n
+  // by putting zero into elements that correspond to level 0 to n.
+  def convertToVectorsWithOneHot(df: DataFrame, factorConverter: Map[String, Map[String, Double]], factorsToRemove: Set[String]): RDD[Vector] = {
+    val names = df.columns
+    val necessaryCols = names.diff(factorsToRemove.toSeq)
+    val necessaryDf = if(necessaryCols.length > 1)
+      df.select(necessaryCols(0), necessaryCols.tail: _*)
+    else
+      df.select(necessaryCols(0))
+    val sizeOfElements: Seq[Int] = ((necessaryCols.map{name =>
+      if(factorConverter.contains(name))
+        factorConverter(name).size
+      else
+        1
+    }).scan(0)(_ + _)).toSeq
+    df.map { r =>
+      val sparseFeatures: Array[(Int, Double)] = (for (indx <- Range(0, necessaryCols.length)) yield {
+        val name = necessaryCols(indx)
+        val init = sizeOfElements(indx)
+        if (factorConverter.contains(name)) {
+          val converter = factorConverter(name)
+          val factor = r.getString(indx)
+          if (converter.contains(factor))
+            Some(((init + converter(factor)).toInt, 1.0))
+          else
+            None
+        } else
+          Some((init, r.getDouble(indx)))
+      }).filterNot(_.isEmpty).map(_.get).toArray
+      Vectors.sparse(sizeOfElements.last, sparseFeatures)
     }
   }
 
@@ -249,5 +329,13 @@ trait Util{
         (xSubtot + xStep, ySubtot, areaSubtot + xStep * ySubtot)
     }
     areaUnderCurve
+  }
+
+  def augmentALabel(r:RDD[LabeledPoint], label: Double, times: Int, acceptRate: Double = 0.9, seed: Long = 10): RDD[LabeledPoint] ={
+    val filtered= r.filter(lp => lp.label == label)
+    val numSamp= filtered.count
+    (for(_ <- Range(0, times)) yield {
+      filtered.sample(true, acceptRate, seed)
+    }).reduce(_ ++ _)
   }
 }
