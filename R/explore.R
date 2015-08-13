@@ -232,8 +232,8 @@ per.bidder <- ddply(bids, .(bidder_id), function(df, thresh=threshold){
                                     ips=length(unique(ip)),
                                     bids=dim(df)[1],
                                     auctions=length(unique(auction)),
-                                    avg.bid.interval=avg,
-                                    sd.bid.interval=stdev
+                                    avg.bid.interval=log(1+avg),
+                                    sd.bid.interval=log(1+stdev)
                                     )
                           }
                     )
@@ -362,3 +362,47 @@ write(mk.schema(bidders.df),paste(schema.dir, "bidders.schema",sep=""),sep="\n")
 write(mk.schema(bids),paste(schema.dir, "bids.schema",sep=""),sep="\n")
 write(mk.schema(submission.set),paste(schema.dir, "submission.schema",sep=""),sep="\n")
 
+######### Yet Another feature engineering
+
+##### ip turns out to be not useful, since one ip corresponds to just one bot bidder.
+ipdata.hoge <- di[,.(humans=sum(outcome==0), bots=sum(outcome==1), distinct.humans= length(unique(bidder <- id[outcome== 0])), distinct.bots=length(unique(bidder <- id[outcome== 1])) ),by=.(ip)]
+ipdata <- mutate(ipdata.hoge, negentropy={prob<-bots/(humans+bots) ; ifelse(prob==0|prob==1, 0, prob * log2(prob) + (1-prob) * log2(1-prob))})
+table(subset(ipdata,humans < bots & humans+bots> 100 & negentropy > -0.1)$distinct.bots)
+
+
+################### define utility function
+find.good.feature <- function(x){
+    tmp <- di[,.(humans=sum(outcome==0), bots=sum(outcome==1), distinct.humans= length(unique(bidder_id[outcome== 0])), distinct.bots=length(unique(bidder_id[outcome== 1])) ),by=x]
+
+    tmp <- mutate(tmp, negentropy={prob<-bots/(humans+bots) ; ifelse(prob==0|prob==1, 0, prob * log2(prob) + (1-prob) * log2(1-prob))})
+###> 0.8 * log2(0.8) + 0.2 * log2(0.2)
+###[1] -0.7219281
+    print(table(subset(tmp,humans < bots & humans+bots> 100 & negentropy > -0.7)$distinct.bots))
+    tmp
+}
+
+####> di[outcome==1, .N]
+####[1] 383337
+####> di[outcome==0, .N]
+####[1] 2215312
+
+######## device seems to work
+
+device.data<- find.good.feature(quote(device))
+## about half is covered if we use 286 devices
+#length(subset(device.data,humans < bots & humans+bots> 100 & negentropy > -1)$bots)
+#[1] 286
+#sum(subset(device.data,humans < bots & humans+bots> 100 & negentropy > -1)$bots)
+#[1] 189390
+#> table(subset(device.data,humans < bots & humans+bots> 100 & negentropy > -1)$distinct.bots)
+#
+# 1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 20 22 23 24 26 27 28 47
+# 7 13 24 44 44 24 20 17 22 10 19 11  3  2  4  3  2  4  3  1  1  3  1  2  1  1
+target.devices <- subset(device.data,humans < bots & humans+bots> 100 & negentropy > -1)$x
+
+########## url seems not to work...
+url.data<- find.good.feature(quote(url))
+#> table(subset(url.data,humans < bots & humans+bots> 100 & negentropy > -1)$distinct.bots)
+#
+# 1  2
+#54 12

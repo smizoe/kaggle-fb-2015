@@ -60,6 +60,13 @@ trait RFConf extends MLConf{ this: DataConf with Util =>
   lazy val maxBins: Int = Seq(100, allMappings.values.map(_.size).max + 1).max
 }
 
+trait SVMConf extends MLConf { this: DataConf with Util =>
+  val modelDir            = "/model/SVM"
+  val cvResultDir         = "/cv-result/SVM"
+  val predictionResultDir = "/submission-result/SVM"
+
+  val numIterations       = 100
+}
 trait CVBase { this: Util with MLConf with S3Conf =>
   import scala.language.reflectiveCalls
   def oneRun[ModelType <: {def predict(targets: RDD[Vector]): RDD[Double]}](trainingDf: DataFrame, validationDf: DataFrame, modelMaker: RDD[LabeledPoint] => ModelType, useOneHot: Boolean = true): RDD[(Double, String, Double, Double)] ={
@@ -77,8 +84,7 @@ trait CVBase { this: Util with MLConf with S3Conf =>
   }
 
   def runCV[ModelType <: {def predict(targets: RDD[Vector]): RDD[Double]}]
-    (numValidationPair: Int,
-     modelMaker: RDD[LabeledPoint] => ModelType)
+    (numValidationPair: Int, modelMaker: RDD[LabeledPoint] => ModelType, useOneHot: Boolean = true)
     (implicit sc: SparkContext, sqlContext: SQLContext): Unit = {
     val bidsDf = createTable(fromS3File(bucket, dataDir + "bids.csv.gz"), bidsSchema)
     val predictions = for(indx <- Range(1, numValidationPair + 1)) yield {
@@ -86,7 +92,7 @@ trait CVBase { this: Util with MLConf with S3Conf =>
       val validationDf = createTable(fromS3File(bucket, dataDir + s"exploration/bidders_validation_${indx}.csv"), biddersSchema)
       val joinedTraining   = innerJoinOnBidderId(biddersDf, bidsDf)
       val joinedValidation = innerJoinOnBidderId(validationDf, bidsDf)
-      val result = oneRun[ModelType](joinedTraining, joinedValidation, modelMaker, false)
+      val result = oneRun[ModelType](joinedTraining, joinedValidation, modelMaker, useOneHot)
       result.map{tuple => tuple.productIterator.toArray.mkString(",")}.saveAsTextFile(bucket + cvResultDir + s"/result_${indx}")
       result
     }
@@ -153,7 +159,11 @@ trait Util{
     } else {
       df.select(namesWithoutOutcome(0))
     }
-    val features = convertToVectors(dfWithoutOutcome, factorConverter, factorsToRemove)
+    val features =
+      if(useOneHot)
+        convertToVectorsWithOneHot(dfWithoutOutcome, factorConverter, factorsToRemove)
+      else
+        convertToVectors(dfWithoutOutcome, factorConverter, factorsToRemove)
     df.rdd.zip(features).map{ case(row, vector) =>
       val outcome =
         if(outcomeConverter.isEmpty)
@@ -199,7 +209,7 @@ trait Util{
       else
         1
     }).scan(0)(_ + _)).toSeq
-    df.map { r =>
+    necessaryDf.map { r =>
       val sparseFeatures: Array[(Int, Double)] = (for (indx <- Range(0, necessaryCols.length)) yield {
         val name = necessaryCols(indx)
         val init = sizeOfElements(indx)
@@ -210,8 +220,9 @@ trait Util{
             Some(((init + converter(factor)).toInt, 1.0))
           else
             None
-        } else
+        } else {
           Some((init, r.getDouble(indx)))
+        }
       }).filterNot(_.isEmpty).map(_.get).toArray
       Vectors.sparse(sizeOfElements.last, sparseFeatures)
     }
